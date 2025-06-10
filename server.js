@@ -1,7 +1,6 @@
 ```javascript
 const express = require('express');
 const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
-const twilio = require('twilio');
 const cron = require('node-cron');
 const bodyParser = require('body-parser');
 const cors = require('cors');
@@ -14,13 +13,6 @@ const PORT = process.env.PORT || 10000;
 app.use(cors());
 app.use(bodyParser.json());
 app.use(bodyParser.urlencoded({ extended: true }));
-
-// Twilio configuratie
-const twilioClient = twilio(
-    process.env.TWILIO_ACCOUNT_SID, 
-    process.env.TWILIO_AUTH_TOKEN
-);
-const twilioPhoneNumber = process.env.TWILIO_PHONE_NUMBER;
 
 // In-memory database (voor productie: gebruik PostgreSQL of MongoDB)
 let pendingPayments = [];
@@ -138,20 +130,19 @@ app.post('/boekings-webhook', async (req, res) => {
             caregiverAmount: caregiverAmount,
             platformAmount: platformAmount,
             createdAt: new Date(),
-            status: 'pending',
-            smsCheckSent: false
+            status: 'pending'
         };
         
         pendingPayments.push(payment);
         
-        // Plan SMS-check voor 48 uur (in productie)
+        // Plan automatische uitbetaling na 48 uur (in productie)
         // Voor demo: 2 minuten
         const checkDelay = process.env.NODE_ENV === 'production' ? 
             48 * 60 * 60 * 1000 : // 48 uur
             2 * 60 * 1000; // 2 minuten voor demo
             
         setTimeout(() => {
-            sendSMSCheck(payment);
+            processAutomaticPayout(payment);
         }, checkDelay);
         
         console.log(`Boeking ${payment.id} ontvangen voor zorgmedewerker ${caregiver.name}`);
@@ -170,107 +161,31 @@ app.post('/boekings-webhook', async (req, res) => {
     }
 });
 
-// SMS-check functie
-async function sendSMSCheck(payment) {
+// Automatische uitbetaling na 48 uur
+async function processAutomaticPayout(payment) {
     try {
-        if (payment.smsCheckSent) {
-            console.log(`SMS al verzonden voor boeking ${payment.id}`);
+        // Controleer of betaling nog pending is
+        const currentPayment = pendingPayments.find(p => p.id === payment.id);
+        if (!currentPayment || currentPayment.status !== 'pending') {
+            console.log(`Betaling ${payment.id} al verwerkt of niet gevonden`);
             return;
         }
         
-        const message = `Hallo ${payment.customerName}, was je tevreden over de zorg van ${payment.caregiverName}? Reageer met JA of NEE. Ref: ${payment.id}`;
+        // Verwerk uitbetaling automatisch na 48 uur
+        await processPayment(currentPayment);
+        currentPayment.status = 'completed';
         
-        await twilioClient.messages.create({
-            body: message,
-            from: twilioPhoneNumber,
-            to: payment.customerPhone
-        });
-        
-        payment.smsCheckSent = true;
-        console.log(`SMS-check verzonden voor boeking ${payment.id} naar ${payment.customerPhone}`);
+        console.log(`Automatische uitbetaling verwerkt voor boeking ${payment.id} na 48 uur`);
         
     } catch (error) {
-        console.error('Fout bij SMS-check:', error);
-        // Markeer als verzonden om herhaalde pogingen te voorkomen
-        payment.smsCheckSent = true;
+        console.error('Fout bij automatische uitbetaling:', error);
+        const currentPayment = pendingPayments.find(p => p.id === payment.id);
+        if (currentPayment) {
+            currentPayment.status = 'failed';
+            currentPayment.error = error.message;
+        }
     }
 }
-
-// Webhook voor SMS-antwoorden
-app.post('/sms-webhook', async (req, res) => {
-    try {
-        console.log('SMS webhook ontvangen:', req.body);
-        
-        const { Body, From } = req.body;
-        const response = Body.toUpperCase().trim();
-        
-        // Normaliseer telefoonnummer
-        const normalizedPhone = From.replace(/\s+/g, '');
-        
-        // Zoek betaling op basis van telefoonnummer
-        const payment = pendingPayments.find(p => 
-            p.customerPhone.replace(/\s+/g, '') === normalizedPhone && 
-            p.status === 'pending'
-        );
-        
-        if (!payment) {
-            console.log(`Geen actieve betaling gevonden voor ${From}`);
-            console.log('Actieve betalingen:', pendingPayments.map(p => ({
-                id: p.id,
-                phone: p.customerPhone,
-                status: p.status
-            })));
-            
-            // Stuur algemene reactie
-            await twilioClient.messages.create({
-                body: 'Geen actieve boeking gevonden voor dit nummer.',
-                from: twilioPhoneNumber,
-                to: From
-            });
-            
-            return res.json({ success: true, message: 'Geen actieve betaling gevonden' });
-        }
-        
-        if (response === 'JA') {
-            // Klant tevreden - verwerk uitbetaling
-            await processPayment(payment);
-            payment.status = 'completed';
-            
-            // Bevestiging naar klant
-            await twilioClient.messages.create({
-                body: `Bedankt voor je positieve feedback! De uitbetaling is verwerkt. Ref: ${payment.id}`,
-                from: twilioPhoneNumber,
-                to: From
-            });
-            
-        } else if (response === 'NEE') {
-            // Klant niet tevreden - geen uitbetaling
-            payment.status = 'disputed';
-            console.log(`Klacht ontvangen voor boeking ${payment.id}`);
-            
-            // Bevestiging naar klant
-            await twilioClient.messages.create({
-                body: `We hebben je feedback ontvangen. Onze klantenservice neemt contact met je op. Ref: ${payment.id}`,
-                from: twilioPhoneNumber,
-                to: From
-            });
-            
-        } else {
-            // Ongeldig antwoord
-            await twilioClient.messages.create({
-                body: `Reageer alsjeblieft met JA of NEE voor ref: ${payment.id}`,
-                from: twilioPhoneNumber,
-                to: From
-            });
-        }
-        
-        res.json({ success: true });
-        
-    } catch (error) {
-        console.error('Fout bij SMS-verwerking:', error);
-        res.status(500).json({ error: error.message });
-    }
-});
 
 // Uitbetaling verwerken
 async function processPayment(payment) {
@@ -294,6 +209,7 @@ async function processPayment(payment) {
         console.error('Fout bij uitbetaling:', error);
         payment.status = 'failed';
         payment.error = error.message;
+        throw error;
     }
 }
 
@@ -325,7 +241,7 @@ app.get('/health', (req, res) => {
 // Dashboard endpoint (voor monitoring)
 app.get('/dashboard', (req, res) => {
     const completedPayments = pendingPayments.filter(p => p.status === 'completed');
-    const disputedPayments = pendingPayments.filter(p => p.status === 'disputed');
+    const failedPayments = pendingPayments.filter(p => p.status === 'failed');
     const totalRevenue = completedPayments.reduce((sum, p) => sum + p.platformAmount, 0);
     
     res.json({
@@ -333,7 +249,7 @@ app.get('/dashboard', (req, res) => {
             totalCaregivers: caregivers.length,
             pendingPayments: pendingPayments.filter(p => p.status === 'pending').length,
             completedPayments: completedPayments.length,
-            disputedPayments: disputedPayments.length,
+            failedPayments: failedPayments.length,
             totalRevenue: totalRevenue / 100 // Convert to euros
         },
         recentPayments: pendingPayments.slice(-10).map(p => ({
@@ -345,6 +261,31 @@ app.get('/dashboard', (req, res) => {
             createdAt: p.createdAt
         }))
     });
+});
+
+// Stripe account return URL
+app.get('/return', (req, res) => {
+    res.send(`
+        <html>
+            <body>
+                <h1>Account setup voltooid!</h1>
+                <p>Je Stripe Express-account is succesvol ingesteld. Je kunt nu betalingen ontvangen via SeniorQuick.</p>
+                <p>Je kunt dit venster sluiten.</p>
+            </body>
+        </html>
+    `);
+});
+
+// Stripe account refresh URL
+app.get('/reauth', (req, res) => {
+    res.send(`
+        <html>
+            <body>
+                <h1>Account setup vereist</h1>
+                <p>Er is aanvullende informatie nodig om je account te voltooien. Neem contact op met support.</p>
+            </body>
+        </html>
+    `);
 });
 
 // Error handling middleware
@@ -369,7 +310,6 @@ app.use((req, res) => {
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`SeniorQuick server draait op poort ${PORT}`);
     console.log(`Environment: ${process.env.NODE_ENV || 'development'}`);
-    console.log(`Twilio configuratie: ${twilioPhoneNumber ? 'OK' : 'ONTBREEKT'}`);
     console.log(`Stripe configuratie: ${process.env.STRIPE_SECRET_KEY ? 'OK' : 'ONTBREEKT'}`);
 });
 
